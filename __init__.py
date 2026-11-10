@@ -149,14 +149,18 @@ def _read_node(subtype, payload):
     }
 
 
-def _texture_index(source):
+def _texture_root(source):
     data_dir = os.path.dirname(os.path.abspath(source))
     while data_dir and os.path.basename(data_dir).casefold() != "data":
         parent = os.path.dirname(data_dir)
         if parent == data_dir:
-            return {}
+            return os.path.join(os.path.dirname(os.path.abspath(source)), "Textures")
         data_dir = parent
-    texture_root = os.path.join(data_dir, "Textures")
+    return os.path.join(data_dir, "Textures")
+
+
+def _texture_index(source):
+    texture_root = _texture_root(source)
     index = {}
     if os.path.isdir(texture_root):
         for folder, _dirs, files in os.walk(texture_root):
@@ -189,12 +193,27 @@ def _load_packed_image(filepath, cache):
     return cache[filepath]
 
 
-def _new_material(mat_id, record, texture_maps, texture_index, image_cache):
+def _load_missing_image(name, texture_root, cache):
+    filename = os.path.basename(name)
+    cache_key = "MISSING:" + filename.casefold()
+    if cache_key not in cache:
+        expected_path = os.path.join(texture_root, filename)
+        image = bpy.data.images.new(filename, width=1, height=1, alpha=True)
+        image.source = "FILE"
+        image.filepath = expected_path
+        image.filepath_raw = expected_path
+        image["DAT missing texture"] = True
+        cache[cache_key] = image
+    return cache[cache_key]
+
+
+def _new_material(mat_id, record, texture_maps, texture_index, texture_root, image_cache):
     name = record["texture"] or next((m["texture"] for m in texture_maps if m["texture"]), "Material")
     material = bpy.data.materials.new(name)
     color = record["color"]
     material.diffuse_color = color
     material.use_fake_user = True
+    material.use_backface_culling = True
     material["DAT material ID"] = "%016X" % mat_id
     material["sh_dat_diffuse_texture"] = record["texture"]
     nodes = material.node_tree.nodes if material.node_tree else None
@@ -213,11 +232,14 @@ def _new_material(mat_id, record, texture_maps, texture_index, image_cache):
         emission_strength.default_value = record["emission"]
 
     def add_image(name, channel):
-        image_path = _resolve_texture(name, texture_index)
-        if not image_path:
+        if not name:
             return None
+        image_path = _resolve_texture(name, texture_index)
         image_node = nodes.new("ShaderNodeTexImage")
-        image_node.image = _load_packed_image(image_path, image_cache)
+        if image_path:
+            image_node.image = _load_packed_image(image_path, image_cache)
+        else:
+            image_node.image = _load_missing_image(name, texture_root, image_cache)
         image_node.label = name
         if channel:
             uv_node = nodes.new("ShaderNodeUVMap")
@@ -229,8 +251,6 @@ def _new_material(mat_id, record, texture_maps, texture_index, image_cache):
     if diffuse:
         material["sh_dat_diffuse_image"] = diffuse.image.filepath
         links.new(diffuse.outputs["Color"], shader.inputs["Base Color"])
-        if diffuse.image.channels == 4:
-            links.new(diffuse.outputs["Alpha"], shader.inputs["Alpha"])
     for tex_map in texture_maps:
         image_node = add_image(tex_map["texture"], tex_map["channel"])
         if not image_node:
@@ -353,11 +373,12 @@ def _build_export_collection(filepath, link_to_scene=False, flip_v=True):
     material_cache = {}
     image_cache = {}
     texture_files = _texture_index(filepath)
+    texture_root = _texture_root(filepath)
     # Keep every material chunk, including unused entries, and preserve the
     # source texture filename as the Blender datablock name.
     for mat_id, record in materials.items():
         material_cache[mat_id] = _new_material(
-            mat_id, record, texture_maps.get(mat_id, []), texture_files, image_cache)
+            mat_id, record, texture_maps.get(mat_id, []), texture_files, texture_root, image_cache)
 
     def get_material(mat_id):
         if mat_id not in material_cache:
@@ -365,7 +386,7 @@ def _build_export_collection(filepath, link_to_scene=False, flip_v=True):
                 "texture": "", "color": (0.58, 0.58, 0.58, 1.0),
                 "specular": (0.0, 0.0, 0.0), "spec_mode": 0,
                 "strength": 0.0, "gloss": 0.0, "emission": 0.0,
-            }, [], texture_files, image_cache)
+            }, [], texture_files, texture_root, image_cache)
         return material_cache[mat_id]
 
     for model_id, data in models.items():
@@ -624,18 +645,29 @@ class SHDATImportFileOperator(Operator):
 
     filepath: StringProperty(name="DAT file", subtype="FILE_PATH")
     filter_glob: StringProperty(default="*.dat", options={"HIDDEN"})
+    flip_v: BoolProperty(
+        name="Flip V axis",
+        description="Convert DAT UVs to Blender's texture origin",
+        default=True)
 
     def invoke(self, context, event):
-        self.filepath = context.scene.sh_dat_export_settings.dat_file
+        settings = context.scene.sh_dat_export_settings
+        self.filepath = settings.dat_file
+        self.flip_v = settings.flip_v
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
+
+    def draw(self, context):
+        self.layout.prop(self, "flip_v")
 
     def execute(self, context):
         source = bpy.path.abspath(self.filepath)
         if not source or not os.path.isfile(source) or not source.lower().endswith(".dat"):
             self.report({"ERROR"}, "Choose an existing .dat file.")
             return {"CANCELLED"}
-        context.scene.sh_dat_export_settings.dat_file = source
+        settings = context.scene.sh_dat_export_settings
+        settings.dat_file = source
+        settings.flip_v = self.flip_v
         return getattr(bpy.ops.sh_dat, "import")()
 
 
